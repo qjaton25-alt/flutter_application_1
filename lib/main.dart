@@ -1,6 +1,9 @@
 import 'dart:async';
 import 'dart:convert';
+import 'dart:math' show min;
+import 'package:flutter/foundation.dart';
 import 'package:flutter/material.dart';
+import 'package:flutter/services.dart';
 import 'package:shared_preferences/shared_preferences.dart';
 import 'package:firebase_core/firebase_core.dart';
 import 'package:firebase_auth/firebase_auth.dart';
@@ -19,7 +22,11 @@ Future<void> main() async {
 
 class AuthFailure implements Exception {
   final String message;
-  AuthFailure(this.message);
+
+  /// Which field the problem belongs to: 'email' | 'password' | 'general'.
+  /// Lets the login screen show the message right under the problem field.
+  final String field;
+  AuthFailure(this.message, {this.field = 'general'});
   @override
   String toString() => message;
 }
@@ -37,12 +44,18 @@ class AuthService {
         email: email.trim(),
         password: password.trim(),
       );
-      if (displayName != null && displayName.trim().isNotEmpty) {
-        await cred.user?.updateDisplayName(displayName.trim());
-        await cred.user?.reload();
+      final name = displayName?.trim() ?? '';
+      if (name.isNotEmpty) {
+        // Save the typed name on this device first, so it always shows up.
+        final uid = cred.user?.uid;
+        if (uid != null) await ProgressStore.setSavedName(uid, name);
+        try {
+          await cred.user?.updateDisplayName(name);
+          await cred.user?.reload();
+        } catch (_) {}
       }
     } on FirebaseAuthException catch (e) {
-      throw AuthFailure(_friendly(e.code));
+      throw _failure(e.code);
     }
   }
 
@@ -53,7 +66,7 @@ class AuthService {
         password: password.trim(),
       );
     } on FirebaseAuthException catch (e) {
-      throw AuthFailure(_friendly(e.code));
+      throw _failure(e.code);
     }
   }
 
@@ -61,41 +74,56 @@ class AuthService {
     try {
       await _auth.sendPasswordResetEmail(email: email.trim());
     } on FirebaseAuthException catch (e) {
-      throw AuthFailure(_friendly(e.code));
+      throw _failure(e.code);
     }
   }
 
   Future<void> signOutUser() => _auth.signOut();
 
-  String _friendly(String code) {
+  // Plain-language messages: say what went wrong AND how to fix it.
+  AuthFailure _failure(String code) {
     switch (code) {
       case 'invalid-email':
-        return 'That email address looks invalid.';
+        return AuthFailure(
+            'That email doesn\'t look right. Try something like name@example.com.',
+            field: 'email');
       case 'user-not-found':
+        return AuthFailure(
+            'No account found with this email. Tap "Create an account" below.',
+            field: 'email');
       case 'wrong-password':
       case 'invalid-credential':
-        return 'Incorrect email or password.';
+        return AuthFailure(
+            'Email or password is incorrect. Check both and try again, or tap Forgot Password.',
+            field: 'password');
       case 'email-already-in-use':
-        return 'An account with this email already exists.';
+        return AuthFailure(
+            'This email already has an account. Try logging in instead.',
+            field: 'email');
       case 'weak-password':
-        return 'Password must be at least 6 characters.';
+        return AuthFailure('Password is too weak. Use at least 6 characters.',
+            field: 'password');
       case 'network-request-failed':
-        return 'No internet connection.';
+        return AuthFailure(
+            'No internet connection. Check your Wi-Fi or data and try again.');
       case 'too-many-requests':
-        return 'Too many attempts. Try again later.';
+        return AuthFailure(
+            'Too many attempts. Please wait a few minutes, then try again.');
       default:
-        return 'Something went wrong. Please try again.';
+        return AuthFailure('Something went wrong on our end. Please try again.');
     }
   }
 }
 
-
-// Name shown on the home screen: the name typed at sign-up, otherwise a
-// cleaned-up version of the email (jethroaton32@gmail.com -> Jethroaton).
+// Name shown on the home screen: the name saved at sign-up / edited by the
+// user, otherwise the Firebase display name, otherwise the email prefix.
 String friendlyName(User? user) {
-  final display = user?.displayName?.trim() ?? '';
+  if (user == null) return 'there';
+  final saved = ProgressStore.savedName(user.uid);
+  if (saved != null && saved.isNotEmpty) return saved;
+  final display = user.displayName?.trim() ?? '';
   if (display.isNotEmpty) return display;
-  final prefix = (user?.email ?? '').split('@').first;
+  final prefix = (user.email ?? '').split('@').first;
   final cleaned = prefix
       .replaceAll(RegExp(r'[0-9]+'), '')
       .replaceAll(RegExp(r'[._-]+'), ' ')
@@ -107,33 +135,74 @@ String friendlyName(User? user) {
       .join(' ');
 }
 
-Future<void> editDisplayName(
-    BuildContext context, VoidCallback onDone) async {
+/// True if the user has a real name (typed at sign-up or edited later).
+bool hasName(User? user) {
+  if (user == null) return false;
+  final saved = ProgressStore.savedName(user.uid);
+  if (saved != null && saved.isNotEmpty) return true;
+  return (user.displayName?.trim() ?? '').isNotEmpty;
+}
+
+/// Name validation (error PREVENTION), shared by sign-up and the
+/// "change name" dialog.
+/// Returns an error message, or null if the name is fine.
+/// Rule: the name must contain at least one letter. Numbers or symbols are
+/// allowed next to letters, but can't make up the whole name.
+String? nameError(String v) {
+  final n = v.trim();
+  if (n.isEmpty) return null; // don't scold a field the user hasn't touched
+  if (!RegExp(r'\p{L}', unicode: true).hasMatch(n)) {
+    return 'Your name needs at least one letter. Numbers or symbols alone won\'t work.';
+  }
+  return null;
+}
+
+Future<void> editDisplayName(BuildContext context, VoidCallback onDone,
+    {String title = 'Your name'}) async {
   final user = FirebaseAuth.instance.currentUser;
   if (user == null) return;
-  final controller = TextEditingController(text: friendlyName(user));
+  final controller =
+      TextEditingController(text: hasName(user) ? friendlyName(user) : '');
   final newName = await showDialog<String>(
     context: context,
-    builder: (ctx) => AlertDialog(
-      title: const Text('Your name'),
-      content: TextField(
-        controller: controller,
-        autofocus: true,
-        textCapitalization: TextCapitalization.words,
-        decoration: const InputDecoration(hintText: 'e.g. Jethro'),
-      ),
-      actions: [
-        TextButton(
-            onPressed: () => Navigator.pop(ctx), child: const Text('Cancel')),
-        TextButton(
-            onPressed: () => Navigator.pop(ctx, controller.text.trim()),
-            child: const Text('Save')),
-      ],
+    builder: (ctx) => StatefulBuilder(
+      builder: (ctx, setLocal) {
+        final err = nameError(controller.text);
+        final valid = controller.text.trim().isNotEmpty && err == null;
+        return AlertDialog(
+          title: Text(title),
+          content: TextField(
+            controller: controller,
+            autofocus: true,
+            textCapitalization: TextCapitalization.words,
+            inputFormatters: [LengthLimitingTextInputFormatter(30)],
+            onChanged: (_) => setLocal(() {}),
+            decoration: InputDecoration(
+              hintText: 'e.g. Jethro',
+              errorText: err,
+              errorMaxLines: 3,
+            ),
+          ),
+          actions: [
+            TextButton(
+                onPressed: () => Navigator.pop(ctx),
+                child: const Text('Cancel')),
+            TextButton(
+                onPressed: valid
+                    ? () => Navigator.pop(ctx, controller.text.trim())
+                    : null,
+                child: const Text('Save')),
+          ],
+        );
+      },
     ),
   );
   if (newName == null || newName.isEmpty) return;
-  await user.updateDisplayName(newName);
-  await user.reload();
+  await ProgressStore.setSavedName(user.uid, newName); // always saved locally
+  try {
+    await user.updateDisplayName(newName);
+    await user.reload();
+  } catch (_) {}
   onDone();
 }
 
@@ -152,13 +221,38 @@ const Color correctColor = Color(0xFF58C27D);
 const Color incorrectColor = Color(0xFFE0584F);
 const Color lightBlue = Color(0xFFE8F5FA);
 
+// Hint card colors (warm amber so hints stand out from the blue question UI)
+const Color hintColor = Color(0xFFFFF4DC);
+const Color hintAccent = Color(0xFFE08A00);
+
+/// Width / height of every sign photo (portrait 3:4, like a phone photo).
+/// If your photos use a different ratio, change this one number and every
+/// photo frame in the app resizes to match.
+const double kSignAspect = 3 / 4;
+
 // Dictionary, Quiz and Honor System
 class SignEntry {
   final String word;
   final String category;
   final String howTo;
 
-  const SignEntry(this.word, this.category, this.howTo);
+  /// One or more photos of the sign, in order.
+  /// 1 photo  -> a still picture.
+  /// 2+ photos -> a short "step by step" loop (for signs that move, like
+  /// Thank you or Welcome).
+  /// Empty    -> the placeholder hand icon is shown.
+  final List<String> images;
+
+  /// Optional short caption for each photo (same order as [images]).
+  final List<String> captions;
+
+  const SignEntry(
+    this.word,
+    this.category,
+    this.howTo, {
+    this.images = const [],
+    this.captions = const [],
+  });
 
   String get id => '${category}_$word';
 }
@@ -166,76 +260,134 @@ class SignEntry {
 const List<SignEntry> allSigns = [
   // Alphabets
 
-  SignEntry('A', 'Alphabets',
-      'Make a fist with your palm facing forward and rest your thumb against the side of your index finger.'),
-  SignEntry('B', 'Alphabets',
-      'Hold your hand up with fingers straight and together, and fold your thumb across your palm.'),
+  SignEntry(
+      'A',
+      'Alphabets',
+      'Make a fist with your palm facing forward and rest your thumb against the side of your index finger.',
+      images: ['assets/signs/a.png']),
+  SignEntry(
+      'B',
+      'Alphabets',
+      'Hold your hand up with fingers straight and together, and fold your thumb across your palm.',
+      images: ['assets/signs/b.png']),
   SignEntry('C', 'Alphabets',
-      'Curve your fingers and thumb into the shape of the letter C.'),
-  SignEntry('D', 'Alphabets',
-      'Point your index finger up and touch the tips of your other fingers to your thumb.'),
-  SignEntry('E', 'Alphabets',
-      'Curl your fingertips down toward your palm and tuck your thumb underneath them.'),
-  SignEntry('F', 'Alphabets',
-      'Touch your thumb and index finger together to make a circle, with the other three fingers up.'),
+      'Curve your fingers and thumb into the shape of the letter C.',
+      images: ['assets/signs/c.png']),
+  SignEntry(
+      'D',
+      'Alphabets',
+      'Point your index finger up and touch the tips of your other fingers to your thumb.',
+      images: ['assets/signs/d.png']),
+  SignEntry(
+      'E',
+      'Alphabets',
+      'Curl your fingertips down toward your palm and tuck your thumb underneath them.',
+      images: ['assets/signs/e.png']),
+  SignEntry(
+      'F',
+      'Alphabets',
+      'Touch your thumb and index finger together to make a circle, with the other three fingers up.',
+      images: ['assets/signs/f.png']),
 
   // Numbers
 
-  SignEntry('One', 'Numbers', 'Hold up your index finger with your palm facing out.'),
-  SignEntry('Two', 'Numbers', 'Hold up your index and middle fingers.'),
-  SignEntry('Three', 'Numbers', 'Hold up your thumb, index and middle fingers.'),
+  SignEntry('One', 'Numbers',
+      'Hold up your index finger with your palm facing out.',
+      images: ['assets/signs/one.png']),
+  SignEntry('Two', 'Numbers', 'Hold up your index and middle fingers.',
+      images: ['assets/signs/two.png']),
+  SignEntry('Three', 'Numbers',
+      'Hold up your thumb, index and middle fingers.',
+      images: ['assets/signs/three.png']),
   SignEntry('Four', 'Numbers',
-      'Hold up four fingers and tuck your thumb into your palm.'),
-  SignEntry('Five', 'Numbers', 'Open your whole hand with all five fingers spread.'),
+      'Hold up four fingers and tuck your thumb into your palm.',
+      images: ['assets/signs/four.png']),
+  SignEntry('Five', 'Numbers',
+      'Open your whole hand with all five fingers spread.',
+      images: ['assets/signs/five.png']),
   SignEntry('Six', 'Numbers',
-      'Touch your thumb to your pinky and hold the other three fingers up.'),
+      'Touch your thumb to your pinky and hold the other three fingers up.',
+      images: ['assets/signs/six.png']),
 
   // Greetings
+  // Signs that move use 2 photos. Add more photos to the list (and a caption
+  // for each) if a sign needs more steps.
 
   SignEntry('Hello', 'Greetings',
-      'Place a flat hand near your forehead and move it outward like a small salute.'),
+      'Place a flat hand near your forehead and move it outward like a small salute.',
+      images: ['assets/signs/hello.png']),
   SignEntry('Goodbye', 'Greetings',
-      'Raise an open hand and fold your fingers down and up as if waving.'),
+      'Raise an open hand and fold your fingers down and up as if waving.',
+      images: ['assets/signs/goodbye.png']),
   SignEntry('Thank you', 'Greetings',
-      'Touch your fingertips to your chin and move your hand forward and down.'),
+      'Touch your fingertips to your chin and move your hand forward and down.',
+      images: ['assets/signs/thankyou.png', 'assets/signs/thankyou2.png'],
+      captions: [
+        'Touch your fingertips to your chin',
+        'Move your hand forward and down',
+      ]),
   SignEntry('Please', 'Greetings',
-      'Rub a flat hand in a circle on your chest.'),
+      'Rub a flat hand in a circle on your chest.',
+      images: ['assets/signs/please1.png']),
   SignEntry('Sorry', 'Greetings',
-      'Make a fist and rub it in a circle on your chest.'),
+      'Make a fist and rub it in a circle on your chest.',
+      images: ['assets/signs/sorry.png']),
   SignEntry('Welcome', 'Greetings',
-      'Hold an open hand out and sweep it inward toward your body.'),
+      'Hold an open hand out and sweep it inward toward your body.',
+      images: ['assets/signs/welcome1.png', 'assets/signs/welcome2.png'],
+      captions: [
+        'Hold an open hand out',
+        'Sweep it inward toward your body',
+      ]),
 
   // Colors
 
   SignEntry('Red', 'Colors',
-      'Brush your index finger downward across your lips.'),
+      'Brush your index finger downward across your lips.',
+      images: ['assets/signs/red.png']),
   SignEntry('Blue', 'Colors',
-      'Make a B handshape and shake it slightly from the wrist.'),
-  SignEntry('Green', 'Colors',
-      'Make a G handshape and shake it slightly from the wrist.'),
+      'Make a B handshape and shake it slightly from the wrist.',
+      images: ['assets/signs/blue.png']),
   SignEntry('Yellow', 'Colors',
-      'Make a Y handshape and shake it slightly from the wrist.'),
+      'Make a Y handshape and shake it slightly from the wrist.',
+      images: ['assets/signs/yellow.png']),
+  SignEntry('Purple', 'Colors',
+      'Make a P handshape and shake it slightly from the wrist.',
+      images: ['assets/signs/purple.png']),
   SignEntry('Black', 'Colors',
-      'Drag your index finger across your forehead from left to right.'),
+      'Drag your index finger across your forehead from left to right.',
+      images: ['assets/signs/black.png']),
   SignEntry('White', 'Colors',
-      'Place your fingertips on your chest and pull them outward, closing them together.'),
+      'Place your fingertips on your chest and pull them outward, closing them together.',
+      images: ['assets/signs/white.png']),
 
   // People & Family
 
   SignEntry('Mother', 'People & Family',
-      'Tap your thumb against your chin with your hand open.'),
+      'Tap your thumb against your chin with your hand open.',
+      images: ['assets/signs/mother.png']),
   SignEntry('Father', 'People & Family',
-      'Tap your thumb against your forehead with your hand open.'),
+      'Tap your thumb against your forehead with your hand open.',
+      images: ['assets/signs/father.png']),
   SignEntry('Sister', 'People & Family',
-      'Touch your thumb to your chin with a fist, then bring it down to your other hand.'),
+      'Touch your thumb to your chin with a fist, then bring it down to your other hand.',
+      images: ['assets/signs/sister.png']),
   SignEntry('Brother', 'People & Family',
-      'Touch your thumb to your forehead with a fist, then bring it down to your other hand.'),
+      'Touch your thumb to your forehead with a fist, then bring it down to your other hand.',
+      images: ['assets/signs/brother.png']),
   SignEntry('Baby', 'People & Family',
-      'Cradle your arms together and rock them side to side.'),
+      'Cradle your arms together and rock them side to side.',
+      images: ['assets/signs/baby.png', 'assets/signs/baby2.png'],
+      captions: [
+        'Cradle your arms together',
+        'Rock them side to side',
+      ]),
   SignEntry('Friend', 'People & Family',
-      'Hook your index fingers together, then switch which one is on top.'),
+      'Hook your index fingers together, then switch which one is on top.',
+      images: ['assets/signs/friend.png']),
   SignEntry('Alone', 'People & Family',
-      'Point your index finger up and move it in a small circle.'),
+      'Point your index finger up and move it in a small circle.',
+      images: ['assets/signs/alone.png']),
 ];
 
 List<SignEntry> signsFor(String category) =>
@@ -256,6 +408,58 @@ class ProgressStore {
   // ---- onboarding seen flag ----
   static bool get onboarded => _p.getBool('onboarded') ?? false;
   static Future<void> setOnboarded() => _p.setBool('onboarded', true);
+
+  // ---- "new here? see the FAQ" banner seen flag (per account) ----
+  static bool get helpSeen => _p.getBool('${_u}_help_seen') ?? false;
+  static Future<void> setHelpSeen() => _p.setBool('${_u}_help_seen', true);
+
+  // ---- display name (per account, saved on this device) ----
+  static String? savedName(String uid) => _p.getString('${uid}_name');
+  static Future<void> setSavedName(String uid, String name) =>
+      _p.setString('${uid}_name', name);
+
+  // ---- "what should we call you?" asked once per account ----
+  static bool get namePrompted => _p.getBool('${_u}_name_prompted') ?? false;
+  static Future<void> setNamePrompted() =>
+      _p.setBool('${_u}_name_prompted', true);
+
+  // ---- daily streak (per account) ----
+  // A day counts when the user opens the app while logged in. It only goes
+  // up by 1 per day, no matter how many lessons or quizzes they do.
+  // Miss a whole day and the streak restarts at 1.
+  static String _dayKey(DateTime d) =>
+      '${d.year}-${d.month.toString().padLeft(2, '0')}-${d.day.toString().padLeft(2, '0')}';
+
+  static String get _today => _dayKey(DateTime.now());
+
+  static String get _yesterday {
+    final n = DateTime.now();
+    return _dayKey(DateTime(n.year, n.month, n.day - 1));
+  }
+
+  /// Current streak. Still shown today if the user last practiced yesterday
+  /// (they have until the end of today to keep it alive); 0 once broken.
+  static int get streak {
+    final last = _p.getString('${_u}_streak_last');
+    if (last == _today || last == _yesterday) {
+      return _p.getInt('${_u}_streak_count') ?? 0;
+    }
+    return 0;
+  }
+
+  static bool get practicedToday =>
+      _p.getString('${_u}_streak_last') == _today;
+
+  /// Counts today toward the streak. Safe to call many times: it only counts
+  /// once per day.
+  static Future<void> recordActivity() async {
+    final last = _p.getString('${_u}_streak_last');
+    if (last == _today) return; // already counted today
+    final int count =
+        last == _yesterday ? (_p.getInt('${_u}_streak_count') ?? 0) + 1 : 1;
+    await _p.setInt('${_u}_streak_count', count);
+    await _p.setString('${_u}_streak_last', _today);
+  }
 
   // ---- lessons completed per category ----
   static int completedLessons(String cat) =>
@@ -348,15 +552,22 @@ class HandTalkApp extends StatelessWidget {
         scaffoldBackgroundColor: backgroundColor,
       ),
       builder: (context, child) {
-        return Container(
-          color: const Color(0xFFE3E8EA),
-          child: Center(
-            child: ConstrainedBox(
-              constraints: const BoxConstraints(maxWidth: 430),
-              child: Container(
-                clipBehavior: Clip.hardEdge,
-                decoration: const BoxDecoration(color: backgroundColor),
-                child: child,
+        // Keep the layout safe when a phone's system font size is very large.
+        final mq = MediaQuery.of(context);
+        return MediaQuery(
+          data: mq.copyWith(
+            textScaler: mq.textScaler.clamp(maxScaleFactor: 1.2),
+          ),
+          child: Container(
+            color: const Color(0xFFE3E8EA),
+            child: Center(
+              child: ConstrainedBox(
+                constraints: const BoxConstraints(maxWidth: 430),
+                child: Container(
+                  clipBehavior: Clip.hardEdge,
+                  decoration: const BoxDecoration(color: backgroundColor),
+                  child: child,
+                ),
               ),
             ),
           ),
@@ -495,6 +706,12 @@ class _OnboardingScreenState extends State<OnboardingScreen> {
           'Watch the tutorial, practice the sign yourself, and assess your performance using Yes, I Got It, Needs Work, or Replay Tutorial.',
       'icon': Icons.play_circle_outline_rounded,
     },
+    {
+      'title': 'Help is Always Here',
+      'description':
+          'Stuck or curious how something works? Open the Help tab at the bottom of the app anytime to read the FAQ.',
+      'icon': Icons.help_outline_rounded,
+    },
   ];
 
   void nextPage() {
@@ -520,42 +737,50 @@ class _OnboardingScreenState extends State<OnboardingScreen> {
     );
   }
 
+  // Scroll-safe: on short phones the content scrolls instead of overflowing.
   Widget buildPage(IconData icon, String title, String description) {
-    return Padding(
-      padding: const EdgeInsets.symmetric(horizontal: 32, vertical: 20),
-      child: Column(
-        mainAxisAlignment: MainAxisAlignment.center,
-        children: [
-          Container(
-            width: 180,
-            height: 180,
-            decoration: const BoxDecoration(
-              color: lightBlue,
-              shape: BoxShape.circle,
+    return LayoutBuilder(
+      builder: (context, constraints) => SingleChildScrollView(
+        child: ConstrainedBox(
+          constraints: BoxConstraints(minHeight: constraints.maxHeight),
+          child: Padding(
+            padding: const EdgeInsets.symmetric(horizontal: 32, vertical: 20),
+            child: Column(
+              mainAxisAlignment: MainAxisAlignment.center,
+              children: [
+                Container(
+                  width: 160,
+                  height: 160,
+                  decoration: const BoxDecoration(
+                    color: lightBlue,
+                    shape: BoxShape.circle,
+                  ),
+                  child: Icon(icon, size: 85, color: primaryColor),
+                ),
+                const SizedBox(height: 36),
+                Text(
+                  title,
+                  textAlign: TextAlign.center,
+                  style: const TextStyle(
+                    fontSize: 27,
+                    fontWeight: FontWeight.bold,
+                    color: primaryColor,
+                  ),
+                ),
+                const SizedBox(height: 18),
+                Text(
+                  description,
+                  textAlign: TextAlign.center,
+                  style: const TextStyle(
+                    fontSize: 16,
+                    color: Color(0xFF666666),
+                    height: 1.5,
+                  ),
+                ),
+              ],
             ),
-            child: Icon(icon, size: 95, color: primaryColor),
           ),
-          const SizedBox(height: 45),
-          Text(
-            title,
-            textAlign: TextAlign.center,
-            style: const TextStyle(
-              fontSize: 27,
-              fontWeight: FontWeight.bold,
-              color: primaryColor,
-            ),
-          ),
-          const SizedBox(height: 18),
-          Text(
-            description,
-            textAlign: TextAlign.center,
-            style: const TextStyle(
-              fontSize: 16,
-              color: Color(0xFF666666),
-              height: 1.5,
-            ),
-          ),
-        ],
+        ),
       ),
     );
   }
@@ -626,7 +851,7 @@ class _OnboardingScreenState extends State<OnboardingScreen> {
                   );
                 }),
               ),
-              const SizedBox(height: 30),
+              const SizedBox(height: 24),
               SizedBox(
                 width: double.infinity,
                 height: 52,
@@ -649,7 +874,7 @@ class _OnboardingScreenState extends State<OnboardingScreen> {
                   ),
                 ),
               ),
-              const SizedBox(height: 16),
+              const SizedBox(height: 12),
             ],
           ),
         ),
@@ -753,13 +978,17 @@ class _GameButtonState extends State<GameButton> {
                       Icon(widget.icon, color: textColor, size: 20),
                       const SizedBox(width: 8),
                     ],
-                    Text(
-                      widget.text,
-                      style: TextStyle(
-                        color: textColor,
-                        fontSize: 15,
-                        fontWeight: FontWeight.w800,
-                        letterSpacing: 0.6,
+                    Flexible(
+                      child: Text(
+                        widget.text,
+                        maxLines: 1,
+                        overflow: TextOverflow.ellipsis,
+                        style: TextStyle(
+                          color: textColor,
+                          fontSize: 15,
+                          fontWeight: FontWeight.w800,
+                          letterSpacing: 0.6,
+                        ),
                       ),
                     ),
                   ],
@@ -822,6 +1051,158 @@ Future<bool> confirmExit(BuildContext context) async {
     ),
   );
   return r ?? false;
+}
+
+// ===============================
+// LOG OUT (error PREVENTION: ask before signing out)
+// ===============================
+
+/// Asks "are you sure?" before logging out. Returns true only if the user
+/// explicitly taps LOG OUT. Tapping STAY or outside the dialog = false.
+Future<bool> confirmLogout(BuildContext context) async {
+  final r = await showDialog<bool>(
+    context: context,
+    builder: (c) => AlertDialog(
+      icon: const Icon(Icons.logout_rounded, color: incorrectColor, size: 40),
+      title: const Text(
+        'Log out of Hand Talk?',
+        textAlign: TextAlign.center,
+      ),
+      content: const Text(
+        'Don\'t worry, your progress is saved to your account. '
+        'Log back in anytime and pick up right where you left off.',
+        textAlign: TextAlign.center,
+      ),
+      actionsAlignment: MainAxisAlignment.spaceEvenly,
+      actions: [
+        // The safe choice comes first and is the filled button.
+        FilledButton(
+          style: FilledButton.styleFrom(
+            backgroundColor: primaryColor,
+            minimumSize: const Size(110, 48),
+          ),
+          onPressed: () => Navigator.pop(c, false),
+          child: const Text('STAY',
+              style: TextStyle(fontWeight: FontWeight.w800)),
+        ),
+        TextButton(
+          style: TextButton.styleFrom(minimumSize: const Size(110, 48)),
+          onPressed: () => Navigator.pop(c, true),
+          child: const Text('LOG OUT',
+              style: TextStyle(
+                  color: incorrectColor, fontWeight: FontWeight.w800)),
+        ),
+      ],
+    ),
+  );
+  return r ?? false;
+}
+
+/// Highlighted, labeled log out button: red-tinted icon + the words "Log out"
+/// so people recognise what it does before they ever tap it.
+class LogoutButton extends StatelessWidget {
+  final VoidCallback onPressed;
+  const LogoutButton({super.key, required this.onPressed});
+
+  @override
+  Widget build(BuildContext context) {
+    return Semantics(
+      button: true,
+      label: 'Log out',
+      child: Tooltip(
+        message: 'Log out',
+        child: InkWell(
+          borderRadius: BorderRadius.circular(14),
+          onTap: onPressed,
+          child: Container(
+            width: 56,
+            height: 48,
+            padding: const EdgeInsets.symmetric(horizontal: 4),
+            decoration: BoxDecoration(
+              color: incorrectColor.withValues(alpha: 0.1),
+              borderRadius: BorderRadius.circular(14),
+              border: Border.all(
+                  color: incorrectColor.withValues(alpha: 0.55), width: 1.5),
+            ),
+            child: const Column(
+              mainAxisAlignment: MainAxisAlignment.center,
+              children: [
+                Icon(Icons.logout_rounded, color: incorrectColor, size: 20),
+                SizedBox(height: 1),
+                FittedBox(
+                  fit: BoxFit.scaleDown,
+                  child: Text(
+                    'Log out',
+                    maxLines: 1,
+                    style: TextStyle(
+                      color: incorrectColor,
+                      fontSize: 10,
+                      fontWeight: FontWeight.w800,
+                    ),
+                  ),
+                ),
+              ],
+            ),
+          ),
+        ),
+      ),
+    );
+  }
+}
+
+// ===============================
+// HINT CARD (stands out from normal text: amber, labeled, bold)
+// ===============================
+
+class HintCard extends StatelessWidget {
+  final String text;
+  final String label;
+  const HintCard({super.key, required this.text, this.label = 'HINT'});
+
+  @override
+  Widget build(BuildContext context) {
+    return Container(
+      width: double.infinity,
+      padding: const EdgeInsets.all(14),
+      decoration: BoxDecoration(
+        color: hintColor,
+        borderRadius: BorderRadius.circular(14),
+        border:
+            Border.all(color: hintAccent.withValues(alpha: 0.5), width: 1.5),
+      ),
+      child: Column(
+        crossAxisAlignment: CrossAxisAlignment.start,
+        children: [
+          Row(
+            mainAxisSize: MainAxisSize.min,
+            children: [
+              const Icon(Icons.lightbulb_rounded, size: 18, color: hintAccent),
+              const SizedBox(width: 6),
+              Text(
+                label,
+                style: const TextStyle(
+                  fontSize: 12,
+                  fontWeight: FontWeight.w900,
+                  letterSpacing: 1,
+                  color: hintAccent,
+                ),
+              ),
+            ],
+          ),
+          const SizedBox(height: 8),
+          Text(
+            text,
+            style: const TextStyle(
+              fontSize: 14,
+              fontWeight: FontWeight.w700,
+              color: Color(0xFF5A3B00),
+              height: 1.45,
+            ),
+          ),
+        ],
+      ),
+    );
+  }
 }
 
 // HAND MASCOT (static, no bounce animation)
@@ -901,7 +1282,7 @@ class HandTalkBadge extends StatelessWidget {
 }
 
 // ===============================
-// STREAK FLAME
+// STREAK FLAME (real streak; grey when there is no active streak)
 // ===============================
 
 class StreakFlame extends StatelessWidget {
@@ -910,28 +1291,32 @@ class StreakFlame extends StatelessWidget {
 
   @override
   Widget build(BuildContext context) {
-    return Container(
-      padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 8),
-      decoration: BoxDecoration(
-        color: Colors.white,
-        borderRadius: BorderRadius.circular(14),
-        border: Border.all(color: flameColor, width: 2),
-      ),
-      child: Row(
-        mainAxisSize: MainAxisSize.min,
-        children: [
-          const Icon(Icons.local_fire_department_rounded,
-              color: flameColor, size: 22),
-          const SizedBox(width: 4),
-          Text(
-            '$days',
-            style: const TextStyle(
-              color: Color(0xFF222222),
-              fontWeight: FontWeight.w800,
-              fontSize: 15,
+    final bool active = days > 0;
+    final Color c = active ? flameColor : Colors.grey;
+    return Semantics(
+      label: active ? '$days day streak' : 'No streak yet',
+      child: Container(
+        padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 8),
+        decoration: BoxDecoration(
+          color: Colors.white,
+          borderRadius: BorderRadius.circular(14),
+          border: Border.all(color: c, width: 2),
+        ),
+        child: Row(
+          mainAxisSize: MainAxisSize.min,
+          children: [
+            Icon(Icons.local_fire_department_rounded, color: c, size: 22),
+            const SizedBox(width: 4),
+            Text(
+              '$days',
+              style: const TextStyle(
+                color: Color(0xFF222222),
+                fontWeight: FontWeight.w800,
+                fontSize: 15,
+              ),
             ),
-          ),
-        ],
+          ],
+        ),
       ),
     );
   }
@@ -976,73 +1361,107 @@ class WelcomePage extends StatelessWidget {
     return Scaffold(
       backgroundColor: backgroundColor,
       body: SafeArea(
-        child: Stack(
-          children: [
-            const _Sparkle(top: 40, left: 40, size: 16, opacity: 0.4),
-            const _Sparkle(top: 90, left: 300, size: 22, opacity: 0.35),
-            const _Sparkle(top: 20, left: 250, size: 12, opacity: 0.5),
-            Padding(
-              padding:
-                  const EdgeInsets.symmetric(horizontal: 32, vertical: 24),
-              child: Column(
-                children: [
-                  const Spacer(),
-                  const HandMascot(size: 190),
-                  const SizedBox(height: 24),
-                  const HandTalkBadge(),
-                  const SizedBox(height: 20),
-                  const Text(
-                    'Learn ASL,\none sign at a time',
-                    textAlign: TextAlign.center,
-                    style: TextStyle(
-                      fontSize: 27,
-                      fontWeight: FontWeight.w900,
-                      color: Color(0xFF222222),
-                      height: 1.2,
+        // Scroll-safe: fills the screen on normal phones, scrolls on short ones.
+        child: LayoutBuilder(
+          builder: (context, constraints) => SingleChildScrollView(
+            child: ConstrainedBox(
+              constraints: BoxConstraints(minHeight: constraints.maxHeight),
+              child: IntrinsicHeight(
+                child: Stack(
+                  children: [
+                    const _Sparkle(top: 40, left: 40, size: 16, opacity: 0.4),
+                    const _Sparkle(top: 90, left: 280, size: 22, opacity: 0.35),
+                    const _Sparkle(top: 20, left: 230, size: 12, opacity: 0.5),
+                    Padding(
+                      padding: const EdgeInsets.symmetric(
+                          horizontal: 32, vertical: 24),
+                      child: Column(
+                        children: [
+                          const Spacer(),
+                          const HandMascot(size: 170),
+                          const SizedBox(height: 20),
+                          const HandTalkBadge(),
+                          const SizedBox(height: 18),
+                          const Text(
+                            'Learn ASL,\none sign at a time',
+                            textAlign: TextAlign.center,
+                            style: TextStyle(
+                              fontSize: 27,
+                              fontWeight: FontWeight.w900,
+                              color: Color(0xFF222222),
+                              height: 1.2,
+                            ),
+                          ),
+                          const SizedBox(height: 14),
+                          Text(
+                            'Master American Sign Language through playful '
+                            'interactive games, bite-sized daily lessons, and '
+                            'smart quiz challenges.',
+                            textAlign: TextAlign.center,
+                            style: TextStyle(
+                              fontSize: 14,
+                              color: Colors.grey[600],
+                              height: 1.5,
+                            ),
+                          ),
+                          const Spacer(),
+                          // GET STARTED -> sign up
+                          GameButton(
+                            text: 'GET STARTED',
+                            color: primaryColor,
+                            shadowColor: primaryShadow,
+                            onTap: () => Navigator.push(
+                              context,
+                              MaterialPageRoute(
+                                  builder: (_) =>
+                                      const LoginPage(signUp: true)),
+                            ),
+                          ),
+                          const SizedBox(height: 14),
+                          // I ALREADY HAVE AN ACCOUNT -> log in
+                          GameButton(
+                            text: 'I ALREADY HAVE AN ACCOUNT',
+                            color: Colors.white,
+                            shadowColor: const Color(0xFFE3E3E3),
+                            textColor: primaryColor,
+                            outlined: true,
+                            borderColor: primaryColor,
+                            onTap: () => Navigator.push(
+                              context,
+                              MaterialPageRoute(
+                                  builder: (_) => const LoginPage()),
+                            ),
+                          ),
+                          const SizedBox(height: 4),
+                          // Account help is findable before the user even signs up
+                          TextButton.icon(
+                            onPressed: () => Navigator.push(
+                              context,
+                              MaterialPageRoute(
+                                  builder: (_) => const FaqPage(
+                                      title: 'Sign up & log in help',
+                                      faqs: authFaqs)),
+                            ),
+                            style: TextButton.styleFrom(
+                                minimumSize: const Size(48, 48)),
+                            icon: const Icon(Icons.help_outline_rounded,
+                                size: 18, color: primaryColor),
+                            label: const Text(
+                              'Need help signing up?',
+                              style: TextStyle(
+                                  color: primaryColor,
+                                  fontWeight: FontWeight.w700,
+                                  fontSize: 13),
+                            ),
+                          ),
+                        ],
+                      ),
                     ),
-                  ),
-                  const SizedBox(height: 14),
-                  Text(
-                    'Master American Sign Language through playful '
-                    'interactive games, bite-sized daily lessons, and '
-                    'smart quiz challenges.',
-                    textAlign: TextAlign.center,
-                    style: TextStyle(
-                      fontSize: 14,
-                      color: Colors.grey[600],
-                      height: 1.5,
-                    ),
-                  ),
-                  const Spacer(),
-                  // GET STARTED -> sign up
-                  GameButton(
-                    text: 'GET STARTED',
-                    color: primaryColor,
-                    shadowColor: primaryShadow,
-                    onTap: () => Navigator.push(
-                      context,
-                      MaterialPageRoute(
-                          builder: (_) => const LoginPage(signUp: true)),
-                    ),
-                  ),
-                  const SizedBox(height: 14),
-                  // I ALREADY HAVE AN ACCOUNT -> log in
-                  GameButton(
-                    text: 'I ALREADY HAVE AN ACCOUNT',
-                    color: Colors.white,
-                    shadowColor: const Color(0xFFE3E3E3),
-                    textColor: primaryColor,
-                    outlined: true,
-                    borderColor: primaryColor,
-                    onTap: () => Navigator.push(
-                      context,
-                      MaterialPageRoute(builder: (_) => const LoginPage()),
-                    ),
-                  ),
-                ],
+                  ],
+                ),
               ),
             ),
-          ],
+          ),
         ),
       ),
     );
@@ -1070,6 +1489,10 @@ class _LoginPageState extends State<LoginPage> {
   bool obscurePassword = true;
   bool loading = false;
 
+  // Errors that come back from Firebase, shown under the matching field.
+  String? serverEmailError;
+  String? serverPasswordError;
+
   @override
   void dispose() {
     nameController.dispose();
@@ -1078,18 +1501,78 @@ class _LoginPageState extends State<LoginPage> {
     super.dispose();
   }
 
+  // ---- validation (error PREVENTION: catch mistakes before submitting) ----
+
+  String? _emailError(String v) {
+    final e = v.trim();
+    if (e.isEmpty) return null; // don't scold a field the user hasn't touched
+    if (!RegExp(r'^[^@\s]+@[^@\s]+\.[^@\s]+$').hasMatch(e)) {
+      return 'Enter a valid email, like name@example.com.';
+    }
+    return serverEmailError;
+  }
+
+  String? _passwordError(String v) {
+    if (v.isEmpty) return null;
+    if (isSignUp && v.length < 6) return 'Use at least 6 characters.';
+    return serverPasswordError;
+  }
+
+  bool get _formValid {
+    final email = emailController.text.trim();
+    final pass = passwordController.text;
+    // Sign up needs a name with at least one letter
+    final nameOk = !isSignUp ||
+        (nameController.text.trim().isNotEmpty &&
+            nameError(nameController.text) == null);
+    return nameOk &&
+        email.isNotEmpty &&
+        pass.isNotEmpty &&
+        _emailError(email) == null &&
+        _passwordError(pass) == null;
+  }
+
+  void _clearServerErrors() {
+    serverEmailError = null;
+    serverPasswordError = null;
+  }
+
   Future<void> _submit() async {
+    if (!_formValid) return;
     final email = emailController.text.trim();
     final pass = passwordController.text.trim();
-    if (email.isEmpty || pass.isEmpty) {
-      showMessage(context, 'Please enter your email and password.');
-      return;
-    }
-    setState(() => loading = true);
+    setState(() {
+      loading = true;
+      _clearServerErrors();
+    });
     try {
       if (isSignUp) {
         await _auth.signUpUser(email, pass, displayName: nameController.text);
+        if (!mounted) return;
+        // Clear feedback that the account now exists.
+        await showDialog<void>(
+          context: context,
+          barrierDismissible: false,
+          builder: (ctx) => AlertDialog(
+            icon: const Icon(Icons.check_circle_rounded,
+                color: correctColor, size: 48),
+            title: const Text('Account created!'),
+            content: Text(
+              'Welcome to Hand Talk, '
+              '${friendlyName(FirebaseAuth.instance.currentUser)}. '
+              'Your progress will be saved to this account.',
+              textAlign: TextAlign.center,
+            ),
+            actions: [
+              TextButton(
+                onPressed: () => Navigator.pop(ctx),
+                child: const Text('START LEARNING'),
+              ),
+            ],
+          ),
+        );
       } else {
+        // Logging in: make sure the user actually gets signed in.
         await _auth.signInUser(email, pass);
       }
       if (!mounted) return;
@@ -1099,7 +1582,16 @@ class _LoginPageState extends State<LoginPage> {
         (route) => false,
       );
     } on AuthFailure catch (e) {
-      if (mounted) showMessage(context, e.message);
+      if (!mounted) return;
+      setState(() {
+        if (e.field == 'email') {
+          serverEmailError = e.message;
+        } else if (e.field == 'password') {
+          serverPasswordError = e.message;
+        } else {
+          showMessage(context, e.message);
+        }
+      });
     } finally {
       if (mounted) setState(() => loading = false);
     }
@@ -1108,24 +1600,37 @@ class _LoginPageState extends State<LoginPage> {
   Future<void> _forgotPassword() async {
     final email = emailController.text.trim();
     if (email.isEmpty) {
-      showMessage(context, 'Enter your email above first.');
+      showMessage(context, 'Type your email above first, then tap Forgot Password.');
+      return;
+    }
+    if (_emailError(email) != null) {
+      showMessage(context, 'Enter a valid email first, like name@example.com.');
       return;
     }
     try {
       await _auth.sendPasswordReset(email);
-      if (mounted) showMessage(context, 'Password reset email sent.');
+      if (mounted) {
+        showMessage(context, 'Password reset email sent. Check your inbox.');
+      }
     } on AuthFailure catch (e) {
       if (mounted) showMessage(context, e.message);
     }
   }
 
-  InputDecoration fieldDecoration(String hint, IconData icon) {
+  InputDecoration fieldDecoration(String hint, IconData icon,
+      {String? errorText, String? helperText}) {
     return InputDecoration(
       hintText: hint,
       hintStyle: TextStyle(color: Colors.grey[500], fontSize: 14),
       prefixIcon: Icon(icon, color: primaryColor, size: 20),
       filled: true,
       fillColor: fieldFillColor,
+      errorText: errorText,
+      errorMaxLines: 3,
+      helperText: helperText,
+      helperMaxLines: 2,
+      errorStyle: const TextStyle(
+          color: incorrectColor, fontSize: 12, fontWeight: FontWeight.w600),
       contentPadding: const EdgeInsets.symmetric(vertical: 16),
       border: OutlineInputBorder(
         borderRadius: BorderRadius.circular(18),
@@ -1140,6 +1645,14 @@ class _LoginPageState extends State<LoginPage> {
       focusedBorder: OutlineInputBorder(
         borderRadius: BorderRadius.circular(18),
         borderSide: const BorderSide(color: primaryColor, width: 2),
+      ),
+      errorBorder: OutlineInputBorder(
+        borderRadius: BorderRadius.circular(18),
+        borderSide: const BorderSide(color: incorrectColor, width: 2),
+      ),
+      focusedErrorBorder: OutlineInputBorder(
+        borderRadius: BorderRadius.circular(18),
+        borderSide: const BorderSide(color: incorrectColor, width: 2),
       ),
     );
   }
@@ -1182,24 +1695,42 @@ class _LoginPageState extends State<LoginPage> {
                 TextField(
                   controller: nameController,
                   cursorColor: primaryColor,
+                  textInputAction: TextInputAction.next,
                   textCapitalization: TextCapitalization.words,
-                  decoration: fieldDecoration('Your name', Icons.person_outline),
+                  inputFormatters: [LengthLimitingTextInputFormatter(30)],
+                  onChanged: (_) => setState(() {}),
+                  decoration: fieldDecoration('Your name', Icons.person_outline,
+                      errorText: nameError(nameController.text),
+                      helperText: 'Must include at least one letter'),
                 ),
                 const SizedBox(height: 16),
               ],
               TextField(
                 controller: emailController,
                 keyboardType: TextInputType.emailAddress,
+                textInputAction: TextInputAction.next,
+                autofillHints: const [AutofillHints.email],
                 cursorColor: primaryColor,
-                decoration: fieldDecoration('Email', Icons.email_outlined),
+                onChanged: (_) => setState(() => serverEmailError = null),
+                decoration: fieldDecoration('Email', Icons.email_outlined,
+                    errorText: _emailError(emailController.text)),
               ),
               const SizedBox(height: 16),
               TextField(
                 controller: passwordController,
                 obscureText: obscurePassword,
+                textInputAction: TextInputAction.done,
                 cursorColor: primaryColor,
-                decoration:
-                    fieldDecoration('Password', Icons.lock_outline).copyWith(
+                onChanged: (_) => setState(() => serverPasswordError = null),
+                onSubmitted: (_) {
+                  if (!loading && _formValid) _submit();
+                },
+                decoration: fieldDecoration(
+                  'Password',
+                  Icons.lock_outline,
+                  errorText: _passwordError(passwordController.text),
+                  helperText: isSignUp ? 'At least 6 characters' : null,
+                ).copyWith(
                   suffixIcon: IconButton(
                     tooltip:
                         obscurePassword ? 'Show password' : 'Hide password',
@@ -1230,7 +1761,7 @@ class _LoginPageState extends State<LoginPage> {
                   ),
                 )
               else
-                const SizedBox(height: 20),
+                const SizedBox(height: 8),
               const SizedBox(height: 12),
               GameButton(
                 text: loading
@@ -1238,11 +1769,15 @@ class _LoginPageState extends State<LoginPage> {
                     : (isSignUp ? 'SIGN UP' : 'LOG IN'),
                 color: primaryColor,
                 shadowColor: primaryShadow,
-                onTap: loading ? null : _submit,
+                // Disabled until the form is valid (error prevention)
+                onTap: (loading || !_formValid) ? null : _submit,
               ),
               const SizedBox(height: 8),
               TextButton(
-                onPressed: () => setState(() => isSignUp = !isSignUp),
+                onPressed: () => setState(() {
+                  isSignUp = !isSignUp;
+                  _clearServerErrors();
+                }),
                 child: Text(
                   isSignUp
                       ? 'Already have an account? Log in'
@@ -1250,6 +1785,22 @@ class _LoginPageState extends State<LoginPage> {
                   style: const TextStyle(
                       color: primaryColor, fontWeight: FontWeight.w700),
                 ),
+              ),
+              TextButton.icon(
+                onPressed: () => Navigator.push(
+                  context,
+                  MaterialPageRoute(
+                      builder: (_) => const FaqPage(
+                          title: 'Sign up & log in help', faqs: authFaqs)),
+                ),
+                style: TextButton.styleFrom(minimumSize: const Size(48, 48)),
+                icon: const Icon(Icons.help_outline_rounded,
+                    size: 18, color: primaryColor),
+                label: const Text('Need help signing up?',
+                    style: TextStyle(
+                        color: primaryColor,
+                        fontSize: 13,
+                        fontWeight: FontWeight.w600)),
               ),
             ],
           ),
@@ -1288,7 +1839,7 @@ const List<CategoryData> categories = [
 ];
 
 // ===============================
-// HOME PAGE (3 tabs: Dictionary / Home / Practice)
+// HOME PAGE (4 tabs: Dictionary / Home / Practice / Help)
 // ===============================
 
 class HomePage extends StatefulWidget {
@@ -1300,8 +1851,48 @@ class HomePage extends StatefulWidget {
 
 class _HomePageState extends State<HomePage> {
   int currentTab = 1;
+  late bool showHelpBanner = !ProgressStore.helpSeen;
 
-  void refresh() => setState(() {});
+  @override
+  void initState() {
+    super.initState();
+    // One streak point per day, counted when the user opens the app logged in.
+    ProgressStore.recordActivity().then((_) {
+      if (mounted) setState(() {});
+    });
+
+    // Existing accounts with no saved name: ask once.
+    WidgetsBinding.instance.addPostFrameCallback((_) async {
+      final user = FirebaseAuth.instance.currentUser;
+      if (!mounted || user == null) return;
+      if (!hasName(user) && !ProgressStore.namePrompted) {
+        await ProgressStore.setNamePrompted();
+        if (!mounted) return;
+        await editDisplayName(context, refresh,
+            title: 'What should we call you?');
+      }
+    });
+  }
+
+  void refresh() {
+    if (mounted) setState(() {});
+  }
+
+  void _openTab(int index) {
+    setState(() {
+      currentTab = index;
+      // Visiting Help counts as "seen", so the banner goes away for good.
+      if (index == 3 && showHelpBanner) {
+        showHelpBanner = false;
+        ProgressStore.setHelpSeen();
+      }
+    });
+  }
+
+  void _dismissHelpBanner() {
+    setState(() => showHelpBanner = false);
+    ProgressStore.setHelpSeen();
+  }
 
   @override
   Widget build(BuildContext context) {
@@ -1312,8 +1903,15 @@ class _HomePageState extends State<HomePage> {
           index: currentTab,
           children: [
             const DictionaryView(),
-            _HomeContent(onProgressChanged: refresh),
+            _HomeContent(
+              onProgressChanged: refresh,
+              showHelpBanner: showHelpBanner,
+              onOpenHelp: () => _openTab(3),
+              onDismissHelp: _dismissHelpBanner,
+            ),
             PracticeView(onChanged: refresh),
+            // Help tab: FAQ about using the app (learning), not about accounts
+            const FaqView(title: 'Help & FAQ', faqs: homeFaqs),
           ],
         ),
       ),
@@ -1331,6 +1929,7 @@ class _HomePageState extends State<HomePage> {
               navIcon(Icons.menu_book_rounded, 'Dictionary', 0),
               navIcon(Icons.home_rounded, 'Home', 1),
               navIcon(Icons.play_lesson_rounded, 'Practice', 2),
+              navIcon(Icons.help_outline_rounded, 'Help', 3),
             ],
           ),
         ),
@@ -1350,11 +1949,11 @@ class _HomePageState extends State<HomePage> {
         label: label,
         child: GestureDetector(
           behavior: HitTestBehavior.opaque,
-          onTap: () => setState(() => currentTab = index),
+          onTap: () => _openTab(index),
           child: AnimatedContainer(
             duration: const Duration(milliseconds: 150),
             height: 63,
-            margin: const EdgeInsets.symmetric(horizontal: 6, vertical: 0),
+            margin: const EdgeInsets.symmetric(horizontal: 4, vertical: 0),
             decoration: BoxDecoration(
               color: selected
                   ? Colors.white.withValues(alpha: 0.2)
@@ -1383,9 +1982,71 @@ class _HomePageState extends State<HomePage> {
   }
 }
 
+// One-time "new here?" banner that points to the Help tab.
+class _HelpBanner extends StatelessWidget {
+  final VoidCallback onOpen;
+  final VoidCallback onDismiss;
+  const _HelpBanner({required this.onOpen, required this.onDismiss});
+
+  @override
+  Widget build(BuildContext context) {
+    return Container(
+      margin: const EdgeInsets.only(top: 14),
+      padding: const EdgeInsets.fromLTRB(12, 4, 0, 4),
+      decoration: BoxDecoration(
+        color: lightBlue,
+        borderRadius: BorderRadius.circular(16),
+        border: Border.all(color: primaryColor.withValues(alpha: 0.4), width: 1.5),
+      ),
+      child: Row(
+        children: [
+          const Icon(Icons.help_outline_rounded, color: primaryColor, size: 22),
+          const SizedBox(width: 10),
+          const Expanded(
+            child: Text(
+              'New here? See how Hand Talk works in the Help tab.',
+              style: TextStyle(
+                  fontSize: 12,
+                  fontWeight: FontWeight.w700,
+                  color: Color(0xFF222222),
+                  height: 1.3),
+            ),
+          ),
+          TextButton(
+            onPressed: onOpen,
+            style: TextButton.styleFrom(minimumSize: const Size(48, 48)),
+            child: const Text('OPEN',
+                style: TextStyle(
+                    color: primaryColor,
+                    fontWeight: FontWeight.w900,
+                    fontSize: 12)),
+          ),
+          IconButton(
+            tooltip: 'Dismiss',
+            constraints: const BoxConstraints(minWidth: 48, minHeight: 48),
+            padding: EdgeInsets.zero,
+            icon: const Icon(Icons.close_rounded,
+                size: 20, color: Color(0xFF888888)),
+            onPressed: onDismiss,
+          ),
+        ],
+      ),
+    );
+  }
+}
+
 class _HomeContent extends StatelessWidget {
   final VoidCallback onProgressChanged;
-  const _HomeContent({required this.onProgressChanged});
+  final bool showHelpBanner;
+  final VoidCallback onOpenHelp;
+  final VoidCallback onDismissHelp;
+
+  const _HomeContent({
+    required this.onProgressChanged,
+    required this.showHelpBanner,
+    required this.onOpenHelp,
+    required this.onDismissHelp,
+  });
 
   @override
   Widget build(BuildContext context) {
@@ -1394,6 +2055,15 @@ class _HomeContent extends StatelessWidget {
 
     final int mastered = allSigns.where(ProgressStore.isMastered).length;
     final double progress = mastered / allSigns.length;
+
+    // Real streak (goes up once per day)
+    final int streak = ProgressStore.streak;
+    final String badge = streak > 0 ? 'STREAK ACTIVE' : 'START YOUR STREAK';
+    final String streakTitle =
+        streak > 0 ? '$streak Day Streak!' : 'No streak yet';
+    final String streakNote = streak <= 1
+        ? 'Come back tomorrow to grow your streak.'
+        : 'Open the app every day to keep it going!';
 
     return Padding(
       padding: const EdgeInsets.symmetric(horizontal: 20),
@@ -1418,28 +2088,38 @@ class _HomeContent extends StatelessWidget {
                     GestureDetector(
                       onTap: () =>
                           editDisplayName(context, onProgressChanged),
-                      child: Text(
-                        'Hi, $name!',
-                        maxLines: 1,
-                        overflow: TextOverflow.ellipsis,
-                        style: const TextStyle(
-                          fontSize: 18,
-                          fontWeight: FontWeight.w900,
-                          color: Color(0xFF222222),
-                        ),
+                      child: Row(
+                        mainAxisSize: MainAxisSize.min,
+                        children: [
+                          Flexible(
+                            child: Text(
+                              'Hi, $name!',
+                              maxLines: 1,
+                              overflow: TextOverflow.ellipsis,
+                              style: const TextStyle(
+                                fontSize: 18,
+                                fontWeight: FontWeight.w900,
+                                color: Color(0xFF222222),
+                              ),
+                            ),
+                          ),
+                          const SizedBox(width: 6),
+                          const Icon(Icons.edit_rounded,
+                              size: 15, color: primaryColor),
+                        ],
                       ),
                     ),
                   ],
                 ),
               ),
-              const StreakFlame(days: 10),
-              // Log out button beside the streak flame
-              IconButton(
-                tooltip: 'Log out',
-                constraints: const BoxConstraints(minWidth: 48, minHeight: 48),
-                icon: const Icon(Icons.logout_rounded,
-                    color: Color(0xFF888888)),
+              StreakFlame(days: streak),
+              const SizedBox(width: 8),
+              // Highlighted, labeled log out button. Asks "are you sure?"
+              // first so nobody signs out by accident.
+              LogoutButton(
                 onPressed: () async {
+                  final sure = await confirmLogout(context);
+                  if (!sure) return;
                   await AuthService().signOutUser();
                   if (!context.mounted) return;
                   Navigator.pushAndRemoveUntil(
@@ -1474,9 +2154,9 @@ class _HomeContent extends StatelessWidget {
                           color: Colors.white.withValues(alpha: 0.2),
                           borderRadius: BorderRadius.circular(6),
                         ),
-                        child: const Text(
-                          'STREAK ACTIVE',
-                          style: TextStyle(
+                        child: Text(
+                          badge,
+                          style: const TextStyle(
                             color: Colors.white,
                             fontSize: 9,
                             fontWeight: FontWeight.bold,
@@ -1485,23 +2165,28 @@ class _HomeContent extends StatelessWidget {
                         ),
                       ),
                       const SizedBox(height: 8),
-                      const Row(
+                      Row(
                         children: [
                           Icon(Icons.local_fire_department_rounded,
-                              color: flameColor, size: 22),
-                          SizedBox(width: 4),
-                          Text(
-                            '10 Day Streak!',
-                            style: TextStyle(
-                                color: Colors.white,
-                                fontSize: 18,
-                                fontWeight: FontWeight.w900),
+                              color: streak > 0
+                                  ? flameColor
+                                  : Colors.white.withValues(alpha: 0.6),
+                              size: 22),
+                          const SizedBox(width: 4),
+                          Flexible(
+                            child: Text(
+                              streakTitle,
+                              style: const TextStyle(
+                                  color: Colors.white,
+                                  fontSize: 18,
+                                  fontWeight: FontWeight.w900),
+                            ),
                           ),
                         ],
                       ),
                       const SizedBox(height: 4),
                       Text(
-                        '$mastered of ${allSigns.length} signs mastered.\nKeep signing!',
+                        '$mastered of ${allSigns.length} signs mastered.\n$streakNote',
                         style: TextStyle(
                           color: Colors.white.withValues(alpha: 0.85),
                           fontSize: 11,
@@ -1541,6 +2226,8 @@ class _HomeContent extends StatelessWidget {
               ],
             ),
           ),
+          if (showHelpBanner)
+            _HelpBanner(onOpen: onOpenHelp, onDismiss: onDismissHelp),
           const SizedBox(height: 22),
           const Text(
             'Learn Categories',
@@ -1564,6 +2251,161 @@ class _HomeContent extends StatelessWidget {
                 data: categories[index],
                 onReturn: onProgressChanged,
               ),
+            ),
+          ),
+        ],
+      ),
+    );
+  }
+}
+
+// ===============================
+// FAQ
+//   authFaqs -> only on Welcome / Sign up / Log in (account help)
+//   homeFaqs -> only on the Home "Help" tab (learning help)
+// ===============================
+
+// FAQ for the Welcome / Sign up / Log in screens
+const List<(String, String)> authFaqs = [
+  ('Do I need an account?',
+      'Yes. Your account keeps your lessons, quiz results, streak and practice ratings saved, and keeps them separate from other people using this phone.'),
+  ('How do I create an account?',
+      'Tap GET STARTED, then enter your name, email and a password. The SIGN UP button turns on once everything is filled in correctly.'),
+  ('What name can I use?',
+      'Anything you like, as long as it has at least one letter, for example "Jethro" or "Sam 2". A name made only of numbers or symbols is not accepted.'),
+  ('What makes a valid password?',
+      'At least 6 characters. Tap the eye icon in the password box to check what you typed.'),
+  ('I already have an account. How do I log in?',
+      'Tap "I already have an account" on the first screen, or tap "Already have an account? Log in" at the bottom of the sign-up form.'),
+  ('It says my email already has an account.',
+      'That means you signed up before. Tap "Already have an account? Log in" and use the same email.'),
+  ('I forgot my password.',
+      'On the Log in screen, type your email and tap "Forgot Password?". We will email you a reset link. If you don\'t see it, check your spam folder.'),
+  ('It says there is no internet connection.',
+      'Sign up and log in need Wi-Fi or mobile data. Check your connection and try again.'),
+];
+
+// FAQ for the Help tab on the Home screen
+const List<(String, String)> homeFaqs = [
+  ('How do lessons work?',
+      'Each category has a path. Lesson 1.1 teaches you the signs, 1.2 is a drag-and-drop quiz, and the next lessons are practice rounds. Finish one lesson to unlock the next.'),
+  ('How do I take the quiz?',
+      'Look at the sign photo, then drag the correct word into the box. Tap "Show hint" if you are stuck. A wrong answer lets you try again.'),
+  ('What does the Honor System mean?',
+      'You watch the sign, copy it with your own hand, then rate yourself honestly: "Yes, I got it" or "Needs work". Signs marked "Needs work" come back at the end.'),
+  ('What do "Learned" and "Needs work" mean?',
+      'They show your own ratings from Practice. "Learned" signs count toward your mastery percentage on the Home screen.'),
+  ('How does the streak work?',
+      'Your streak goes up by 1 for each day you open Hand Talk while logged in, no matter how many lessons you do. If you miss a whole day, it starts again at 1.'),
+  ('How do I find a specific sign?',
+      'Open the Dictionary tab, then use the search bar or the menu button to filter by category.'),
+  ('Is my progress saved?',
+      'Yes. Quiz progress, lesson completion, streak and practice ratings are saved on this device under your account.'),
+  ('How do I change my name?',
+      'On the Home screen, tap your name in "Hi, ...!" and type a new one. It needs at least one letter.'),
+  ('How do I log out?',
+      'Tap the red "Log out" button at the top right of the Home screen, next to your streak. We will ask you to confirm, so you can\'t log out by accident. Your progress stays saved to your account.'),
+];
+
+class FaqPage extends StatelessWidget {
+  final String title;
+  final List<(String, String)> faqs;
+  const FaqPage({super.key, required this.title, required this.faqs});
+
+  @override
+  Widget build(BuildContext context) {
+    return Scaffold(
+      backgroundColor: backgroundColor,
+      body: SafeArea(
+          child: FaqView(title: title, faqs: faqs, showBack: true)),
+    );
+  }
+}
+
+class FaqView extends StatelessWidget {
+  final String title;
+  final List<(String, String)> faqs;
+  final bool showBack;
+  const FaqView({
+    super.key,
+    required this.faqs,
+    this.title = 'Help & FAQ',
+    this.showBack = false,
+  });
+
+  @override
+  Widget build(BuildContext context) {
+    return Padding(
+      padding: const EdgeInsets.symmetric(horizontal: 20, vertical: 12),
+      child: Column(
+        crossAxisAlignment: CrossAxisAlignment.start,
+        children: [
+          Row(
+            children: [
+              if (showBack)
+                IconButton(
+                  tooltip: 'Back',
+                  constraints:
+                      const BoxConstraints(minWidth: 48, minHeight: 48),
+                  icon: const Icon(Icons.arrow_back_ios_new_rounded,
+                      color: Color(0xFF222222)),
+                  onPressed: () => Navigator.pop(context),
+                )
+              else
+                const SizedBox(height: 48),
+              Expanded(
+                child: Text(title,
+                    style: const TextStyle(
+                        fontSize: 22,
+                        fontWeight: FontWeight.w900,
+                        color: Color(0xFF222222))),
+              ),
+            ],
+          ),
+          const SizedBox(height: 4),
+          Text('Tap a question to see the answer.',
+              style: TextStyle(fontSize: 12, color: Colors.grey[600])),
+          const SizedBox(height: 12),
+          Expanded(
+            child: ListView.separated(
+              padding: const EdgeInsets.only(bottom: 20),
+              itemCount: faqs.length,
+              separatorBuilder: (_, __) => const SizedBox(height: 10),
+              itemBuilder: (context, i) {
+                final (q, a) = faqs[i];
+                return Container(
+                  decoration: BoxDecoration(
+                    color: Colors.white,
+                    borderRadius: BorderRadius.circular(16),
+                    border: Border.all(
+                        color: primaryColor.withValues(alpha: 0.2), width: 1.5),
+                  ),
+                  child: Theme(
+                    data: Theme.of(context)
+                        .copyWith(dividerColor: Colors.transparent),
+                    child: ExpansionTile(
+                      tilePadding: const EdgeInsets.symmetric(horizontal: 14),
+                      childrenPadding:
+                          const EdgeInsets.fromLTRB(14, 0, 14, 14),
+                      expandedCrossAxisAlignment: CrossAxisAlignment.start,
+                      iconColor: primaryColor,
+                      collapsedIconColor: primaryColor,
+                      title: Text(q,
+                          style: const TextStyle(
+                              fontSize: 14,
+                              fontWeight: FontWeight.w800,
+                              color: Color(0xFF222222))),
+                      children: [
+                        Text(a,
+                            style: TextStyle(
+                                fontSize: 13,
+                                height: 1.5,
+                                color: Colors.grey[700])),
+                      ],
+                    ),
+                  ),
+                );
+              },
             ),
           ),
         ],
@@ -1675,16 +2517,22 @@ class _CategoryCardState extends State<CategoryCard> {
 
 // ===============================
 // LESSON PATH PAGE
+//   1.1  Learn     (LearnPage)
+//   1.2  Quiz      (DragDropQuizPage)
+//   1.3+ Practice  (HonorSystemPage)
+// A green line connects each finished lesson to the next one.
 // ===============================
 
 class LessonNodeData {
   final String label;
+  final String kind; // 'Learn' | 'Quiz' | 'Practice'
   final bool unlocked;
   final bool completed;
   final Alignment align;
 
   const LessonNodeData({
     required this.label,
+    required this.kind,
     required this.unlocked,
     required this.completed,
     required this.align,
@@ -1703,6 +2551,10 @@ class _LessonPathPageState extends State<LessonPathPage> {
   late int nodeCount;
   late int completed; // saved: number of lessons completed
 
+  static const double _nodeSize = 76;
+  static const double _itemHeight = 120; // vertical distance between nodes
+  static const double _nodeCenterY = 38; // _nodeSize / 2
+
   @override
   void initState() {
     super.initState();
@@ -1711,20 +2563,23 @@ class _LessonPathPageState extends State<LessonPathPage> {
         .clamp(0, nodeCount);
   }
 
+  String _kindFor(int i) => i == 0 ? 'Learn' : (i == 1 ? 'Quiz' : 'Practice');
+
   List<LessonNodeData> get nodes => List.generate(
         nodeCount,
         (i) => LessonNodeData(
           label: '1.${i + 1}',
+          kind: _kindFor(i),
           unlocked: i <= completed,
           completed: i < completed,
-          align: i.isEven ? Alignment.centerLeft : Alignment.centerRight,
+          align: i.isEven ? Alignment.topLeft : Alignment.topRight,
         ),
       );
 
-  /// Two signs per honor-system lesson.
+  /// Two signs per honor-system lesson (lessons 1.3 and up).
   List<SignEntry> _lessonSigns(int lessonIndex) {
     final signs = signsFor(widget.category.title);
-    final start = ((lessonIndex - 1) * 2) % signs.length;
+    final start = ((lessonIndex - 2) * 2) % signs.length;
     return [signs[start], signs[(start + 1) % signs.length]];
   }
 
@@ -1736,12 +2591,17 @@ class _LessonPathPageState extends State<LessonPathPage> {
     }
     final label = '1.${index + 1}';
 
-    final Widget page = index == 0
-        ? DragDropQuizPage(category: widget.category, lessonLabel: label)
-        : HonorSystemPage(
-            title: '${widget.category.title} · $label',
-            signs: _lessonSigns(index),
-          );
+    final Widget page;
+    if (index == 0) {
+      page = LearnPage(category: widget.category);
+    } else if (index == 1) {
+      page = DragDropQuizPage(category: widget.category, lessonLabel: label);
+    } else {
+      page = HonorSystemPage(
+        title: '${widget.category.title} · $label',
+        signs: _lessonSigns(index),
+      );
+    }
 
     final result = await Navigator.push<bool>(
       context,
@@ -1759,8 +2619,9 @@ class _LessonPathPageState extends State<LessonPathPage> {
   @override
   Widget build(BuildContext context) {
     final nodeList = nodes;
+    // The quiz is lesson 1.2
     final quizResult =
-        ProgressStore.quizResult(widget.category.title, '1.1');
+        ProgressStore.quizResult(widget.category.title, '1.2');
 
     return Scaffold(
       backgroundColor: backgroundColor,
@@ -1788,7 +2649,7 @@ class _LessonPathPageState extends State<LessonPathPage> {
                           color: Color(0xFF222222)),
                     ),
                   ),
-                  const StreakFlame(days: 10),
+                  StreakFlame(days: ProgressStore.streak),
                   const SizedBox(width: 4),
                 ],
               ),
@@ -1820,7 +2681,7 @@ class _LessonPathPageState extends State<LessonPathPage> {
                           ),
                           const SizedBox(height: 4),
                           Text(
-                            '$completed of $nodeCount lessons complete.\nProgress is saved automatically.',
+                            '$completed of $nodeCount lessons complete.\nStart with Learn, then test yourself.',
                             style: TextStyle(
                                 color: Colors.white.withValues(alpha: 0.85),
                                 fontSize: 11,
@@ -1859,34 +2720,100 @@ class _LessonPathPageState extends State<LessonPathPage> {
             const SizedBox(height: 8),
             Expanded(
               child: ListView.builder(
+                // The connector lines are drawn slightly outside each item's
+                // box, so don't wrap items in clipping repaint boundaries.
+                addRepaintBoundaries: false,
                 padding: const EdgeInsets.fromLTRB(24, 24, 24, 40),
                 itemCount: nodeList.length,
                 itemBuilder: (context, index) {
                   final node = nodeList[index];
-                  return Padding(
-                    padding: const EdgeInsets.only(bottom: 28),
-                    child: Align(
-                      alignment: node.align,
-                      child: Column(
-                        mainAxisSize: MainAxisSize.min,
-                        children: [
-                          LessonNode(
-                            data: node,
-                            onTap: () => _openLesson(index),
+                  final bool isLast = index == nodeList.length - 1;
+                  final bool onRight = node.align == Alignment.topRight;
+
+                  final caption = Column(
+                    mainAxisSize: MainAxisSize.min,
+                    crossAxisAlignment: onRight
+                        ? CrossAxisAlignment.end
+                        : CrossAxisAlignment.start,
+                    children: [
+                      Text(
+                        node.kind,
+                        style: TextStyle(
+                          fontSize: 13,
+                          fontWeight: FontWeight.w800,
+                          color: node.unlocked
+                              ? const Color(0xFF222222)
+                              : Colors.grey[500],
+                        ),
+                      ),
+                      if (index == 1 && quizResult != null)
+                        Text(
+                          'Best: ${quizResult['best']}/${quizResult['total']}',
+                          style: TextStyle(
+                            fontSize: 11,
+                            fontWeight: FontWeight.w700,
+                            color: Colors.grey[600],
                           ),
-                          if (index == 0 && quizResult != null) ...[
-                            const SizedBox(height: 6),
-                            Text(
-                              'Best: ${quizResult['best']}/${quizResult['total']}',
-                              style: TextStyle(
-                                fontSize: 11,
-                                fontWeight: FontWeight.w700,
-                                color: Colors.grey[600],
+                        ),
+                    ],
+                  );
+
+                  final nodeWidget = LessonNode(
+                    data: node,
+                    onTap: () => _openLesson(index),
+                  );
+
+                  return SizedBox(
+                    height: _itemHeight,
+                    child: LayoutBuilder(
+                      builder: (context, constraints) {
+                        final w = constraints.maxWidth;
+                        const half = _nodeSize / 2;
+                        final x1 = onRight ? w - half : half;
+                        final x2 = onRight ? half : w - half;
+
+                        return Stack(
+                          clipBehavior: Clip.none,
+                          children: [
+                            // Line to the NEXT node: grey, and it fills in
+                            // green (animated) once THIS lesson is completed.
+                            if (!isLast)
+                              Positioned.fill(
+                                child: TweenAnimationBuilder<double>(
+                                  tween: Tween<double>(
+                                      end: node.completed ? 1.0 : 0.0),
+                                  duration: const Duration(milliseconds: 800),
+                                  curve: Curves.easeInOut,
+                                  builder: (context, value, _) => CustomPaint(
+                                    painter: PathConnectorPainter(
+                                      from: Offset(x1, _nodeCenterY),
+                                      to: Offset(
+                                          x2, _itemHeight + _nodeCenterY),
+                                      progress: value,
+                                    ),
+                                  ),
+                                ),
+                              ),
+                            Align(
+                              alignment: node.align,
+                              child: Row(
+                                mainAxisSize: MainAxisSize.min,
+                                children: onRight
+                                    ? [
+                                        caption,
+                                        const SizedBox(width: 10),
+                                        nodeWidget,
+                                      ]
+                                    : [
+                                        nodeWidget,
+                                        const SizedBox(width: 10),
+                                        caption,
+                                      ],
                               ),
                             ),
                           ],
-                        ],
-                      ),
+                        );
+                      },
                     ),
                   );
                 },
@@ -1897,6 +2824,50 @@ class _LessonPathPageState extends State<LessonPathPage> {
       ),
     );
   }
+}
+
+// Draws the curved line between two lesson nodes.
+// Grey track underneath, green fill on top (progress 0..1).
+class PathConnectorPainter extends CustomPainter {
+  final Offset from;
+  final Offset to;
+  final double progress;
+
+  PathConnectorPainter({
+    required this.from,
+    required this.to,
+    required this.progress,
+  });
+
+  @override
+  void paint(Canvas canvas, Size size) {
+    final midY = (from.dy + to.dy) / 2;
+    final path = Path()
+      ..moveTo(from.dx, from.dy)
+      ..cubicTo(from.dx, midY, to.dx, midY, to.dx, to.dy);
+
+    final track = Paint()
+      ..color = lockedNodeColor
+      ..style = PaintingStyle.stroke
+      ..strokeWidth = 8
+      ..strokeCap = StrokeCap.round;
+    canvas.drawPath(path, track);
+
+    if (progress > 0) {
+      final fill = Paint()
+        ..color = correctColor
+        ..style = PaintingStyle.stroke
+        ..strokeWidth = 8
+        ..strokeCap = StrokeCap.round;
+      for (final metric in path.computeMetrics()) {
+        canvas.drawPath(metric.extractPath(0, metric.length * progress), fill);
+      }
+    }
+  }
+
+  @override
+  bool shouldRepaint(covariant PathConnectorPainter old) =>
+      old.progress != progress || old.from != from || old.to != to;
 }
 
 // ===============================
@@ -1990,7 +2961,173 @@ class _LessonNodeState extends State<LessonNode> {
 }
 
 // ===============================
-// DRAG & DROP QUIZ PAGE (lesson 1.1) — progress is SAVED
+// LEARN PAGE (lesson x.1)
+// Teaches every sign in the category BEFORE any quiz, so first-time users
+// aren't tested on things they've never seen.
+// ===============================
+
+class LearnPage extends StatefulWidget {
+  final CategoryData category;
+  const LearnPage({super.key, required this.category});
+
+  @override
+  State<LearnPage> createState() => _LearnPageState();
+}
+
+class _LearnPageState extends State<LearnPage> {
+  late final List<SignEntry> signs;
+  int index = 0;
+  int replayToken = 0;
+
+  @override
+  void initState() {
+    super.initState();
+    signs = signsFor(widget.category.title);
+  }
+
+  bool get isFirst => index == 0;
+  bool get isLast => index == signs.length - 1;
+
+  void _go(int delta) {
+    setState(() {
+      index = (index + delta).clamp(0, signs.length - 1);
+      replayToken++; // restart the new sign's tutorial
+    });
+  }
+
+  Future<void> _finish() async {
+    if (!mounted) return;
+    Navigator.pop(context, true);
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    final sign = signs[index];
+
+    return Scaffold(
+      backgroundColor: backgroundColor,
+      body: SafeArea(
+        child: Padding(
+          padding: const EdgeInsets.symmetric(horizontal: 24, vertical: 12),
+          child: Column(
+            crossAxisAlignment: CrossAxisAlignment.start,
+            children: [
+              Row(
+                children: [
+                  ExitButton(onPressed: () => Navigator.pop(context, false)),
+                  const SizedBox(width: 8),
+                  Expanded(
+                    child: ClipRRect(
+                      borderRadius: BorderRadius.circular(8),
+                      child: LinearProgressIndicator(
+                        value: (index + 1) / signs.length,
+                        minHeight: 10,
+                        backgroundColor: primaryColor.withValues(alpha: 0.18),
+                        valueColor:
+                            const AlwaysStoppedAnimation<Color>(primaryColor),
+                      ),
+                    ),
+                  ),
+                ],
+              ),
+              const SizedBox(height: 14),
+              Expanded(
+                child: SingleChildScrollView(
+                  child: Column(
+                    crossAxisAlignment: CrossAxisAlignment.start,
+                    children: [
+                      Text(
+                        'Learn · ${widget.category.title} · '
+                        '${index + 1} of ${signs.length}',
+                        style: TextStyle(
+                            fontSize: 12,
+                            fontWeight: FontWeight.w700,
+                            color: Colors.grey[500]),
+                      ),
+                      const SizedBox(height: 6),
+                      const Text(
+                        'Watch, then copy the sign',
+                        style: TextStyle(
+                          fontSize: 20,
+                          fontWeight: FontWeight.w900,
+                          color: Color(0xFF222222),
+                        ),
+                      ),
+                      const SizedBox(height: 16),
+                      SignVideoBox(
+                        sign: sign,
+                        replayToken: replayToken,
+                        maxHeight: 300,
+                      ),
+                      const SizedBox(height: 16),
+                      Text(
+                        sign.word,
+                        style: const TextStyle(
+                            fontSize: 28,
+                            fontWeight: FontWeight.w900,
+                            color: Color(0xFF222222)),
+                      ),
+                      const SizedBox(height: 10),
+                      HintCard(text: sign.howTo, label: 'HOW TO SIGN'),
+                      const SizedBox(height: 12),
+                      Container(
+                        width: double.infinity,
+                        padding: const EdgeInsets.all(12),
+                        decoration: BoxDecoration(
+                          color: lightBlue,
+                          borderRadius: BorderRadius.circular(12),
+                        ),
+                        child: Row(
+                          children: [
+                            const Icon(Icons.back_hand_outlined,
+                                size: 18, color: primaryColor),
+                            const SizedBox(width: 8),
+                            Expanded(
+                              child: Text(
+                                'Your turn: make the sign with your own hand '
+                                'before tapping next.',
+                                style: TextStyle(
+                                    fontSize: 12,
+                                    color: Colors.grey[700],
+                                    height: 1.4),
+                              ),
+                            ),
+                          ],
+                        ),
+                      ),
+                      const SizedBox(height: 16),
+                    ],
+                  ),
+                ),
+              ),
+              GameButton(
+                text: isLast ? 'FINISH LEARNING' : 'NEXT SIGN',
+                color: primaryColor,
+                shadowColor: primaryShadow,
+                icon: isLast ? Icons.check_rounded : null,
+                onTap: isLast ? _finish : () => _go(1),
+              ),
+              const SizedBox(height: 10),
+              GameButton(
+                text: 'BACK',
+                color: Colors.white,
+                shadowColor: const Color(0xFFE3E3E3),
+                textColor: primaryColor,
+                outlined: true,
+                borderColor: primaryColor,
+                onTap: isFirst ? null : () => _go(-1),
+              ),
+              const SizedBox(height: 8),
+            ],
+          ),
+        ),
+      ),
+    );
+  }
+}
+
+// ===============================
+// DRAG & DROP QUIZ PAGE (lesson 1.2) — progress is SAVED
 // ===============================
 
 class DragDropQuizPage extends StatefulWidget {
@@ -2203,6 +3340,28 @@ class _DragDropQuizPageState extends State<DragDropQuizPage> {
     );
   }
 
+  // The picture shown as the quiz prompt: the real photo(s) when the sign has
+  // them, otherwise the placeholder hand icon.
+  Widget _buildPrompt() {
+    if (current.images.isNotEmpty) {
+      return SignVideoBox(sign: current, maxHeight: 230);
+    }
+    return Center(
+      child: Container(
+        width: 120,
+        height: 120,
+        decoration: BoxDecoration(
+          color: lightBlue,
+          shape: BoxShape.circle,
+          border:
+              Border.all(color: primaryColor.withValues(alpha: 0.3), width: 3),
+        ),
+        child:
+            const Icon(Icons.back_hand_rounded, size: 60, color: primaryColor),
+      ),
+    );
+  }
+
   Widget _buildQuestion() {
     final Color boxBorder = !answered
         ? primaryColor.withValues(alpha: 0.5)
@@ -2233,53 +3392,36 @@ class _DragDropQuizPageState extends State<DragDropQuizPage> {
                 height: 1.3,
               ),
             ),
-            const SizedBox(height: 22),
+            const SizedBox(height: 18),
 
-            // sign prompt
-            Center(
-              child: Container(
-                width: 120,
-                height: 120,
-                decoration: BoxDecoration(
-                  color: lightBlue,
-                  shape: BoxShape.circle,
-                  border: Border.all(
-                      color: primaryColor.withValues(alpha: 0.3), width: 3),
-                ),
-                child: const Icon(Icons.back_hand_rounded,
-                    size: 60, color: primaryColor),
-              ),
-            ),
+            // sign prompt (photo or placeholder)
+            _buildPrompt(),
             const SizedBox(height: 8),
             Center(
               child: TextButton.icon(
                 onPressed: () => setState(() => showHint = !showHint),
                 style: TextButton.styleFrom(minimumSize: const Size(48, 48)),
                 icon: const Icon(Icons.lightbulb_outline_rounded,
-                    size: 16, color: primaryColor),
+                    size: 16, color: hintAccent),
                 label: Text(showHint ? 'Hide hint' : 'Show hint',
                     style: const TextStyle(
-                        color: primaryColor,
+                        color: hintAccent,
                         fontSize: 12,
-                        fontWeight: FontWeight.w700)),
+                        fontWeight: FontWeight.w800)),
               ),
             ),
-            if (showHint)
-              Container(
-                width: double.infinity,
-                padding: const EdgeInsets.all(12),
-                margin: const EdgeInsets.only(bottom: 8),
-                decoration: BoxDecoration(
-                  color: lightBlue,
-                  borderRadius: BorderRadius.circular(12),
-                ),
-                child: Text(
-                  current.howTo,
-                  textAlign: TextAlign.center,
-                  style: TextStyle(
-                      fontSize: 12, color: Colors.grey[700], height: 1.4),
-                ),
-              ),
+            // Hint: amber card, labeled and bold so it doesn't blend in
+            AnimatedSize(
+              duration: const Duration(milliseconds: 200),
+              curve: Curves.easeOut,
+              alignment: Alignment.topCenter,
+              child: showHint
+                  ? Padding(
+                      padding: const EdgeInsets.only(bottom: 8),
+                      child: HintCard(text: current.howTo),
+                    )
+                  : const SizedBox(width: double.infinity),
+            ),
             const SizedBox(height: 8),
 
             // drop zone
@@ -2416,19 +3558,28 @@ class _ChoiceTile extends StatelessWidget {
 }
 
 // ===============================
-// SIGN VIDEO BOX (placeholder tutorial player)
+// SIGN VIDEO BOX
+//
+// Shows a sign:
+//  - photos (1 or more) -> drawn in a frame with the exact photo ratio
+//    (kSignAspect), the whole picture is always visible, nothing is cropped.
+//    2+ photos loop automatically like a tiny animation; tap to step.
+//  - no photos          -> the placeholder "tap to play" box.
+//
+// [maxHeight] is the tallest the photo frame may be; the width follows from
+// the ratio and never exceeds the available width, so it fits any phone.
 // ===============================
 
 class SignVideoBox extends StatefulWidget {
-  final String word;
+  final SignEntry sign;
   final int replayToken;
-  final double height;
+  final double maxHeight;
 
   const SignVideoBox({
     super.key,
-    required this.word,
+    required this.sign,
     this.replayToken = 0,
-    this.height = 200,
+    this.maxHeight = 260,
   });
 
   @override
@@ -2436,12 +3587,60 @@ class SignVideoBox extends StatefulWidget {
 }
 
 class _SignVideoBoxState extends State<SignVideoBox> {
+  // placeholder state
   bool playing = false;
   Timer? _timer;
 
-  void _play() {
+  // photo state
+  int frame = 0;
+  Timer? _frameTimer;
+
+  List<String> get _images => widget.sign.images;
+  bool get _hasPhoto => _images.isNotEmpty;
+  bool get _multi => _images.length > 1;
+
+  @override
+  void initState() {
+    super.initState();
+    _startFrames();
+  }
+
+  @override
+  void didChangeDependencies() {
+    super.didChangeDependencies();
+    _precache();
+  }
+
+  // Load every frame ahead of time so the loop never flickers.
+  void _precache() {
+    for (final path in _images) {
+      precacheImage(AssetImage(path), context, onError: (e, s) {});
+    }
+  }
+
+  void _startFrames({bool reset = true}) {
+    _frameTimer?.cancel();
+    if (reset) frame = 0;
+    if (!_multi) return;
+    _frameTimer = Timer.periodic(const Duration(milliseconds: 1200), (_) {
+      if (!mounted) return;
+      setState(() => frame = (frame + 1) % _images.length);
+    });
+  }
+
+  void _stepFrame() {
+    if (!_multi) return;
+    setState(() => frame = (frame + 1) % _images.length);
+    _startFrames(reset: false);
+  }
+
+  void _play({bool notify = true}) {
     _timer?.cancel();
-    setState(() => playing = true);
+    if (notify) {
+      setState(() => playing = true);
+    } else {
+      playing = true;
+    }
     _timer = Timer(const Duration(seconds: 3), () {
       if (mounted) setState(() => playing = false);
     });
@@ -2450,24 +3649,142 @@ class _SignVideoBoxState extends State<SignVideoBox> {
   @override
   void didUpdateWidget(covariant SignVideoBox oldWidget) {
     super.didUpdateWidget(oldWidget);
-    if (oldWidget.replayToken != widget.replayToken) {
-      _play();
+    final bool signChanged = oldWidget.sign.id != widget.sign.id;
+    final bool replay = oldWidget.replayToken != widget.replayToken;
+
+    if (signChanged) {
+      _timer?.cancel();
+      playing = false;
+      _startFrames();
+      _precache();
+    } else if (replay && _hasPhoto) {
+      _startFrames();
+    }
+
+    if (replay && !_hasPhoto) {
+      _play(notify: false);
     }
   }
 
   @override
   void dispose() {
     _timer?.cancel();
+    _frameTimer?.cancel();
     super.dispose();
   }
 
-  @override
-  Widget build(BuildContext context) {
+  Widget _brokenImage(String path) {
+    return Center(
+      child: Padding(
+        padding: const EdgeInsets.all(8),
+        child: Column(
+          mainAxisSize: MainAxisSize.min,
+          children: [
+            const Icon(Icons.broken_image_outlined,
+                size: 40, color: primaryColor),
+            if (kDebugMode) ...[
+              const SizedBox(height: 6),
+              Text(
+                path,
+                textAlign: TextAlign.center,
+                style: TextStyle(fontSize: 10, color: Colors.grey[600]),
+              ),
+            ],
+          ],
+        ),
+      ),
+    );
+  }
+
+  Widget _buildPhoto() {
+    final images = _images;
+    final int i = frame % images.length;
+    final String? caption =
+        (_multi && i < widget.sign.captions.length) ? widget.sign.captions[i] : null;
+
+    return LayoutBuilder(
+      builder: (context, constraints) {
+        final double availW = constraints.maxWidth.isFinite
+            ? constraints.maxWidth
+            : widget.maxHeight * kSignAspect;
+        final double w = min(availW, widget.maxHeight * kSignAspect);
+        final double h = w / kSignAspect;
+
+        return Center(
+          child: Column(
+            mainAxisSize: MainAxisSize.min,
+            children: [
+              GestureDetector(
+                onTap: _stepFrame,
+                child: Container(
+                  width: w,
+                  height: h,
+                  decoration: BoxDecoration(
+                    color: Colors.white,
+                    borderRadius: BorderRadius.circular(20),
+                    border: Border.all(
+                        color: primaryColor.withValues(alpha: 0.4), width: 2),
+                  ),
+                  child: ClipRRect(
+                    borderRadius: BorderRadius.circular(18),
+                    child: Image.asset(
+                      images[i],
+                      fit: BoxFit.contain,
+                      gaplessPlayback: true,
+                      errorBuilder: (c, e, s) => _brokenImage(images[i]),
+                    ),
+                  ),
+                ),
+              ),
+              if (_multi) ...[
+                const SizedBox(height: 10),
+                Row(
+                  mainAxisAlignment: MainAxisAlignment.center,
+                  children: List.generate(images.length, (d) {
+                    final bool active = d == i;
+                    return AnimatedContainer(
+                      duration: const Duration(milliseconds: 200),
+                      margin: const EdgeInsets.symmetric(horizontal: 3),
+                      width: active ? 18 : 8,
+                      height: 8,
+                      decoration: BoxDecoration(
+                        color: active
+                            ? primaryColor
+                            : primaryColor.withValues(alpha: 0.25),
+                        borderRadius: BorderRadius.circular(4),
+                      ),
+                    );
+                  }),
+                ),
+                const SizedBox(height: 6),
+                SizedBox(
+                  width: w,
+                  child: Text(
+                    caption != null
+                        ? 'Step ${i + 1} of ${images.length} · $caption'
+                        : 'Step ${i + 1} of ${images.length}',
+                    textAlign: TextAlign.center,
+                    style: TextStyle(
+                      fontSize: 12,
+                      fontWeight: FontWeight.w700,
+                      color: Colors.grey[600],
+                    ),
+                  ),
+                ),
+              ],
+            ],
+          ),
+        );
+      },
+    );
+  }
+
+  Widget _buildPlaceholder() {
     return GestureDetector(
       onTap: _play,
       child: Container(
         width: double.infinity,
-        height: widget.height,
+        height: 190,
         decoration: BoxDecoration(
           color: primaryColor,
           borderRadius: BorderRadius.circular(20),
@@ -2488,7 +3805,9 @@ class _SignVideoBoxState extends State<SignVideoBox> {
                 ),
                 const SizedBox(height: 8),
                 Text(
-                  playing ? 'Signing "${widget.word}"...' : 'Tap to play',
+                  playing
+                      ? 'Signing "${widget.sign.word}"...'
+                      : 'Tap to play',
                   style: TextStyle(
                     color: Colors.white.withValues(alpha: 0.9),
                     fontSize: 12,
@@ -2521,6 +3840,43 @@ class _SignVideoBoxState extends State<SignVideoBox> {
           ],
         ),
       ),
+    );
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    return _hasPhoto ? _buildPhoto() : _buildPlaceholder();
+  }
+}
+
+// Small photo used in lists (first photo of the sign, same 3:4 ratio).
+class SignThumb extends StatelessWidget {
+  final SignEntry sign;
+  final double height;
+  const SignThumb({super.key, required this.sign, this.height = 64});
+
+  @override
+  Widget build(BuildContext context) {
+    final double width = height * kSignAspect;
+    return Container(
+      width: width,
+      height: height,
+      clipBehavior: Clip.antiAlias,
+      decoration: BoxDecoration(
+        color: lightBlue,
+        borderRadius: BorderRadius.circular(12),
+        border:
+            Border.all(color: primaryColor.withValues(alpha: 0.25), width: 1),
+      ),
+      child: sign.images.isEmpty
+          ? const Icon(Icons.back_hand_rounded, color: primaryColor, size: 22)
+          : Image.asset(
+              sign.images.first,
+              fit: BoxFit.cover,
+              cacheWidth: 200,
+              errorBuilder: (c, e, s) => const Icon(Icons.back_hand_rounded,
+                  color: primaryColor, size: 22),
+            ),
     );
   }
 }
@@ -2630,41 +3986,48 @@ class _HonorSystemPageState extends State<HonorSystemPage> {
     return Column(
       crossAxisAlignment: CrossAxisAlignment.start,
       children: [
-        Text(widget.title,
-            style: TextStyle(
-                fontSize: 12,
-                fontWeight: FontWeight.w700,
-                color: Colors.grey[500])),
-        const SizedBox(height: 6),
-        const Text(
-          'Review the\nfollowing hand sign',
-          style: TextStyle(
-            fontSize: 20,
-            fontWeight: FontWeight.w900,
-            color: Color(0xFF222222),
-            height: 1.25,
+        // Scrollable content so nothing overflows on small phones
+        Expanded(
+          child: SingleChildScrollView(
+            child: Column(
+              crossAxisAlignment: CrossAxisAlignment.start,
+              children: [
+                Text(widget.title,
+                    style: TextStyle(
+                        fontSize: 12,
+                        fontWeight: FontWeight.w700,
+                        color: Colors.grey[500])),
+                const SizedBox(height: 6),
+                const Text(
+                  'Review the\nfollowing hand sign',
+                  style: TextStyle(
+                    fontSize: 20,
+                    fontWeight: FontWeight.w900,
+                    color: Color(0xFF222222),
+                    height: 1.25,
+                  ),
+                ),
+                const SizedBox(height: 18),
+                SignVideoBox(
+                  sign: sign,
+                  replayToken: replayToken,
+                  maxHeight: 260,
+                ),
+                const SizedBox(height: 16),
+                Text(
+                  sign.word,
+                  style: const TextStyle(
+                      fontSize: 26,
+                      fontWeight: FontWeight.w900,
+                      color: Color(0xFF222222)),
+                ),
+                const SizedBox(height: 8),
+                HintCard(text: sign.howTo, label: 'HOW TO SIGN'),
+                const SizedBox(height: 12),
+              ],
+            ),
           ),
         ),
-        const SizedBox(height: 18),
-        SignVideoBox(
-          word: sign.word,
-          replayToken: replayToken,
-          height: 190,
-        ),
-        const SizedBox(height: 16),
-        Text(
-          sign.word,
-          style: const TextStyle(
-              fontSize: 26,
-              fontWeight: FontWeight.w900,
-              color: Color(0xFF222222)),
-        ),
-        const SizedBox(height: 6),
-        Text(
-          sign.howTo,
-          style: TextStyle(fontSize: 13, color: Colors.grey[600], height: 1.45),
-        ),
-        const Spacer(),
         GameButton(
           text: 'YES, I GOT IT',
           color: primaryColor,
@@ -2921,7 +4284,7 @@ class _DictionaryViewState extends State<DictionaryView> {
           Expanded(
             child: list.isEmpty
                 ? Center(
-                    child: Text('No signs found.',
+                    child: Text('No signs found. Try a different word or category.',
                         style: TextStyle(color: Colors.grey[500])),
                   )
                 : ListView.separated(
@@ -2987,7 +4350,7 @@ class _DictionaryTile extends StatelessWidget {
     return GestureDetector(
       onTap: onTap,
       child: Container(
-        padding: const EdgeInsets.all(14),
+        padding: const EdgeInsets.all(12),
         decoration: BoxDecoration(
           color: Colors.white,
           borderRadius: BorderRadius.circular(16),
@@ -2995,16 +4358,7 @@ class _DictionaryTile extends StatelessWidget {
         ),
         child: Row(
           children: [
-            Container(
-              width: 44,
-              height: 44,
-              decoration: BoxDecoration(
-                color: lightBlue,
-                borderRadius: BorderRadius.circular(12),
-              ),
-              child: const Icon(Icons.back_hand_rounded,
-                  color: primaryColor, size: 22),
-            ),
+            SignThumb(sign: sign, height: 64),
             const SizedBox(width: 12),
             Expanded(
               child: Column(
@@ -3057,50 +4411,42 @@ class _SignDetailPageState extends State<SignDetailPage> {
             children: [
               ExitButton(onPressed: () => Navigator.pop(context)),
               const SizedBox(height: 6),
-              const Text('Dictionary',
-                  style: TextStyle(
-                      fontSize: 12,
-                      fontWeight: FontWeight.w700,
-                      color: Color(0xFF888888))),
-              const SizedBox(height: 4),
-              Row(
-                children: [
-                  Expanded(
-                    child: Text(sign.word,
-                        style: const TextStyle(
-                            fontSize: 28,
-                            fontWeight: FontWeight.w900,
-                            color: Color(0xFF222222))),
+              // Scrollable so the photo + text never overflow on small phones
+              Expanded(
+                child: SingleChildScrollView(
+                  child: Column(
+                    crossAxisAlignment: CrossAxisAlignment.start,
+                    children: [
+                      const Text('Dictionary',
+                          style: TextStyle(
+                              fontSize: 12,
+                              fontWeight: FontWeight.w700,
+                              color: Color(0xFF888888))),
+                      const SizedBox(height: 4),
+                      Row(
+                        children: [
+                          Expanded(
+                            child: Text(sign.word,
+                                style: const TextStyle(
+                                    fontSize: 28,
+                                    fontWeight: FontWeight.w900,
+                                    color: Color(0xFF222222))),
+                          ),
+                          _StatusChip(status: ProgressStore.honor(sign)),
+                        ],
+                      ),
+                      Text(sign.category,
+                          style: TextStyle(
+                              fontSize: 12, color: Colors.grey[500])),
+                      const SizedBox(height: 18),
+                      HintCard(text: sign.howTo, label: 'HOW TO SIGN'),
+                      const SizedBox(height: 18),
+                      SignVideoBox(sign: sign, maxHeight: 300),
+                      const SizedBox(height: 16),
+                    ],
                   ),
-                  _StatusChip(status: ProgressStore.honor(sign)),
-                ],
-              ),
-              Text(sign.category,
-                  style: TextStyle(fontSize: 12, color: Colors.grey[500])),
-              const SizedBox(height: 18),
-              const Text('How to sign:',
-                  style: TextStyle(
-                      fontSize: 15,
-                      fontWeight: FontWeight.w900,
-                      color: Color(0xFF222222))),
-              const SizedBox(height: 8),
-              Container(
-                width: double.infinity,
-                padding: const EdgeInsets.all(14),
-                decoration: BoxDecoration(
-                  color: Colors.white,
-                  borderRadius: BorderRadius.circular(14),
-                  border: Border(
-                      left: BorderSide(
-                          color: primaryColor.withValues(alpha: 0.6), width: 4)),
                 ),
-                child: Text(sign.howTo,
-                    style: TextStyle(
-                        fontSize: 13, color: Colors.grey[700], height: 1.5)),
               ),
-              const SizedBox(height: 18),
-              SignVideoBox(word: sign.word, height: 190),
-              const Spacer(),
               GameButton(
                 text: 'PRACTICE THIS SIGN',
                 color: primaryColor,
